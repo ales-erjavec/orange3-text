@@ -1,17 +1,15 @@
 # coding: utf-8
-from urllib.parse import urljoin
-from urllib.request import pathname2url
-
-from collections import defaultdict, Counter
-from os import path
-from math import pi as PI
 import re
+from collections import defaultdict, Counter
+from itertools import chain
 
 import numpy as np
 
 from PyQt4 import QtCore, QtGui
+from PyQt4.QtCore import Qt, QObject, QUrl
 
 from Orange.widgets import widget, gui, settings
+from Orange.widgets.utils import webview
 from Orange.data import Table
 from orangecontrib.text.corpus import Corpus
 from orangecontrib.text.country_codes import \
@@ -19,6 +17,12 @@ from orangecontrib.text.country_codes import \
     CC_WORLD, INV_CC_WORLD, \
     CC_USA, INV_CC_USA, SET_CC_USA
 
+if webview.HAVE_WEBENGINE:
+    WebViewClass = webview.WebEngineView
+elif webview.HAVE_WEBKIT:
+    WebViewClass = webview.WebKitView
+else:
+    raise ImportError("No supported web view")
 
 CC_NAMES = re.compile('[\w\s\.\-]+')
 
@@ -30,6 +34,33 @@ class Map:
     all = (('World',  WORLD),
            ('Europe', EUROPE),
            ('USA',    USA))
+
+
+HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+html, body, #map {{margin:0px;padding:0px;width:100%;height:100%;}}
+</style>
+<link  href="resources/jquery-jvectormap-2.0.2.css" rel="stylesheet">
+<script src="resources/jquery-2.1.4.min.js"></script>
+<script src="resources/jquery-jvectormap-2.0.2.min.js"></script>
+<script src="resources/jquery-jvectormap-world-mill-en.js"></script>
+<script src="resources/jquery-jvectormap-europe-mill-en.js"></script>
+<script src="resources/jquery-jvectormap-us-aea-en.js"></script>
+<script src="resources/geomap-script.js"></script>
+<script>
+REGIONS = {};
+</script>
+</head>
+<body>
+<div id="map"></div>
+</body>
+</html>'''.format({Map.WORLD: CC_WORLD,
+                   Map.EUROPE: CC_EUROPE,
+                   Map.USA: CC_USA})
 
 
 class OWGeoMap(widget.OWWidget):
@@ -45,17 +76,28 @@ class OWGeoMap(widget.OWWidget):
     selected_map = settings.Setting(0)
     regions = settings.Setting([])
 
+    class _PyBridge(QObject):
+        def __init__(self, parent=None, bridged=None):
+            super().__init__(parent)
+            self.bridged = bridged
+
+        @QtCore.pyqtSlot("QVariantList")
+        def region_selected(self, regions):
+            """Called from JavaScript"""
+            self.bridged.region_selected(regions)
+
     def __init__(self):
         super().__init__()
+        self.data = None
+        self.metas = []
+        self.webview = None
         self._create_layout()
 
-    @QtCore.pyqtSlot(str, result=str)
     def region_selected(self, regions):
-        """Called from JavaScript"""
         if not regions:
             self.regions = []
             return self.send('Corpus', None)
-        self.regions = regions.split(',')
+        self.regions = [str(r) for r in regions]
         attr = self.metas[self.selected_attr]
         if attr.is_discrete: return  # TODO, FIXME: make this work for discrete attrs also
         from Orange.data.filter import FilterRegex
@@ -78,36 +120,19 @@ class OWGeoMap(widget.OWWidget):
                                     QtGui.QSizePolicy.Fixed)
         self.attr_combo.setSizePolicy(hexpand)
         self.map_combo.setSizePolicy(hexpand)
-        html = '''
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<base href="{}/"/>
-<style>
-html, body, #map {{margin:0px;padding:0px;width:100%;height:100%;}}
-</style>
-<link  href="resources/jquery-jvectormap-2.0.2.css" rel="stylesheet">
-</head>
-<body>
-<div id="map"></div>
-</body>
-</html>'''.format(urljoin('file:', pathname2url(path.abspath(path.dirname(__file__)))))
-        self.webview = gui.WebviewWidget(self.controlArea, self, debug=True)
-        self.webview.setHtml(html)
-        for script in ('jquery-2.1.4.min.js',
-                       'jquery-jvectormap-2.0.2.min.js',
-                       'jquery-jvectormap-world-mill-en.js',
-                       'jquery-jvectormap-europe-mill-en.js',
-                       'jquery-jvectormap-us-aea-en.js',
-                       'geomap-script.js'):
-            self.webview.evalJS(open(path.join(path.dirname(__file__), 'resources', script), encoding='utf-8').read())
-        self.webview.evalJS('REGIONS = {};'.format({Map.WORLD: CC_WORLD,
-                                                    Map.EUROPE: CC_EUROPE,
-                                                    Map.USA: CC_USA}))
+
+        self.webview = WebViewClass(
+            self.controlArea, OWGeoMap._PyBridge(self, self),
+            contextMenuPolicy=Qt.NoContextMenu
+        )
+        self.webview.loadFinished.connect(self.__on_webview_load)
+        self.webview.setHtml(HTML, QUrl.fromLocalFile(__file__))
+        self.controlArea.layout().addWidget(self.webview)
+
+    def __on_webview_load(self):
+        self.redraw_webview_map()
 
     def _repopulate_attr_combo(self, data):
-        from itertools import chain
         self.metas = [a for a in chain(data.domain.metas,
                                        data.domain.attributes,
                                        data.domain.class_vars)
@@ -125,13 +150,13 @@ html, body, #map {{margin:0px;padding:0px;width:100%;height:100%;}}
             self.attr_combo.setCurrentIndex(self.attr_combo.findText(self.metas[self.selected_attr].name))
 
     def on_data(self, data):
-        if data and not isinstance(data, Corpus):
+        if data is not None and not isinstance(data, Corpus):
             data = Corpus.from_table(data.domain, data)
         self.data = data
         self._repopulate_attr_combo(data)
-        if not data:
-            self.region_selected('')
-            self.webview.evalJS('DATA = {}; renderMap();')
+        if data is None:
+            self.region_selected([])
+            self.redraw_webview_map()
         else:
             self.on_attr_change()
 
@@ -140,26 +165,44 @@ html, body, #map {{margin:0px;padding:0px;width:100%;height:100%;}}
             self.map_combo.setCurrentIndex(self.map_combo.findData(map_code))
         else:
             map_code = self.map_combo.itemData(self.selected_map)
+        self.redraw_webview_map()
 
-        inv_cc_map, cc_map = {Map.USA: (INV_CC_USA, CC_USA),
-                              Map.WORLD: (INV_CC_WORLD, CC_WORLD),
-                              Map.EUROPE: (INV_CC_EUROPE, CC_EUROPE)} [map_code]
-        # Set country counts in JS
-        data = defaultdict(int)
-        for cc in getattr(self, 'cc_counts', ()):
-            key = inv_cc_map.get(cc, cc)
-            if key in cc_map:
-                data[key] += self.cc_counts[cc]
-        self.webview.evalJS('DATA = {};'.format(dict(data)))
-        # Draw the new map
-        self.webview.evalJS('MAP_CODE = "{}";'.format(map_code))
-        self.webview.evalJS('SELECTED_REGIONS = {};'.format(self.regions))
-        self.webview.evalJS('renderMap();')
+    def redraw_webview_map(self):
+        map_code = self.map_combo.itemData(self.selected_map)
+        if self.data is not None:
+            map_code = self.map_combo.itemData(self.selected_map)
+            inv_cc_map, cc_map = {
+                Map.USA: (INV_CC_USA, CC_USA),
+                Map.WORLD: (INV_CC_WORLD, CC_WORLD),
+                Map.EUROPE: (INV_CC_EUROPE, CC_EUROPE)}[map_code]
+
+            data = defaultdict(int)
+            for cc in getattr(self, 'cc_counts', ()):
+                key = inv_cc_map.get(cc, cc)
+                if key in cc_map:
+                    data[key] += self.cc_counts[cc]
+        else:
+            data = {}
+
+        script_template = """
+        if (typeof renderMap !== "undefined") {{
+            DATA = {};
+            MAP_CODE = "{}";
+            SELECTED_REGIONS = {};
+            renderMap();
+            "Success";
+        }} else {{
+            "Try again";
+        }}
+        """
+        script = script_template.format(dict(data), map_code, self.regions)
+        self.webview.runJavaScript(script, print)
 
     def on_attr_change(self):
         attr = self.metas[self.selected_attr]
         if attr.is_discrete:
-            return self.warning(0, 'Discrete region attributes not yet supported. Patches welcome!')
+            self.warning(0, 'Discrete region attributes not yet supported. Patches welcome!')
+            return
         countries = (set(map(str.strip, CC_NAMES.findall(i.lower()))) if len(i) > 3 else (i,)
                      for i in self.data.get_column_view(self.data.domain.index(attr))[0])
         def flatten(seq):

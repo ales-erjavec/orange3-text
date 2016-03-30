@@ -1,5 +1,3 @@
-document.body.style.cursor = 'default';
-document.body.style.webkitUserSelect = 'none';
 
 // Options for WordCloud
 var OPTIONS = {
@@ -47,8 +45,8 @@ function clearSelection() {
 
 // Mark words in SELECTED_WORDS list selected
 var SELECTED_WORDS = [];
-document.getElementById('canvas')
-    .addEventListener('wordclouddrawn', selectWords);
+//document.getElementById('canvas')
+//    .addEventListener('wordclouddrawn', selectWords);
 function selectWords() {
     var lookup = {};
     var spans = document.getElementsByTagName('span');
@@ -59,3 +57,11 @@ function selectWords() {
         spans[i].className = lookup[spans[i].innerHTML] === true ? 'selected' : '';
     }
 }
+
+function onDocLoad() {
+    document.body.style.cursor = 'default';
+    document.body.style.webkitUserSelect = 'none';
+    document.getElementById('canvas')
+            .addEventListener('wordclouddrawn', selectWords);
+}
+

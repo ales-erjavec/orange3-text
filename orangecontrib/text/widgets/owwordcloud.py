@@ -1,15 +1,22 @@
 # coding: utf-8
 from collections import Counter
+import textwrap
 from math import pi as PI
 from os import path
 
 import numpy as np
 from PyQt4 import QtCore, QtGui
-from PyQt4.QtCore import Qt
+from PyQt4.QtCore import Qt, QObject, QUrl
 from PyQt4.QtGui import QItemSelection, QItemSelectionModel
 
 from Orange.widgets import widget, gui, settings
 from Orange.widgets.utils.itemmodels import PyTableModel
+
+try:
+    from Orange.widgets.utils.webview import WebEngineView as WebViewClass
+except ImportError:
+    from Orange.widgets.utils.webview import WebKitView as WebViewClass
+
 from orangecontrib.text.corpus import Corpus
 from orangecontrib.text.topics import Topics
 
@@ -19,7 +26,7 @@ class SelectedWords(set):
         self.widget = widget
 
     def _update_webview(self):
-        self.widget.webview.evalJS('SELECTED_WORDS = {};'.format(list(self)))
+        self.widget.webview.runJavaScript('SELECTED_WORDS = {};'.format(list(self)))
 
     def _update_filter(self):
         filter = set()
@@ -54,6 +61,22 @@ class SelectedWords(set):
 class Output:
     CORPUS = 'Corpus'
 
+HTML = '''
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="resources/wordcloud2.js"></script>
+<script src="resources/wordcloud-script.js"></script>
+<style>
+html, body {margin:0px;padding:0px;width:100%;height:100%;}
+span:hover {color:OrangeRed !important}
+span.selected {color:red !important}
+</style>
+</head>
+<body id="canvas" onload="onDocLoad()"></body>
+</html>'''
+
 
 class OWWordCloud(widget.OWWidget):
     name = "Word Cloud"
@@ -71,20 +94,29 @@ class OWWordCloud(widget.OWWidget):
     words_color = settings.Setting(True)
     words_tilt = settings.Setting(0)
 
+    class _PyBridge(QtCore.QObject):
+        def __init__(self, parent=None, bridged=None):
+            super().__init__(parent)
+            self.bridged = bridged
+
+        @QtCore.pyqtSlot(str, result=str)
+        def word_clicked(self, word):
+            """Called from JavaScript"""
+            return self.bridged.word_clicked(word)
+
     def __init__(self):
         super().__init__()
         self.n_topic_words = 0
         self.documents_info_str = ''
         self.selected_words = SelectedWords(self)
         self.webview = None
+        self.wordlist = []
         self.topics = None
         self.corpus = None
         self.corpus_counter = None
         self._create_layout()
 
-    @QtCore.pyqtSlot(str, result=str)
     def word_clicked(self, word):
-        """Called from JavaScript"""
         if not word:
             self.selected_words.clear()
             return ''
@@ -106,25 +138,23 @@ class OWWordCloud(widget.OWWidget):
             return ''
 
     def _new_webview(self):
-        HTML = '''
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-html, body {margin:0px;padding:0px;width:100%;height:100%;}
-span:hover {color:OrangeRed !important}
-span.selected {color:red !important}
-</style>
-</head>
-<body id="canvas"></body>
-</html>'''
         if self.webview:
             self.mainArea.layout().removeWidget(self.webview)
-        self.webview = gui.WebviewWidget(self.mainArea, self, HTML, debug=True)
-        for script in ('wordcloud2.js',
-                       'wordcloud-script.js'):
-            self.webview.evalJS(open(path.join(path.dirname(__file__), 'resources', script), encoding='utf-8').read())
+            self.webview.loadFinished.disconnect(self.__on_webview_load())
+            self.webview.deleteLater()
+        self.webview = WebViewClass(
+            self.mainArea, OWWordCloud._PyBridge(self, self))
+        self.webview.loadFinished.connect(self.__on_webview_load)
+        self.webview.setHtml(HTML, QUrl.fromLocalFile(__file__))
+        self.mainArea.layout().addWidget(self.webview)
+
+    def reset_webview(self):
+        self.webview.setHtml(HTML, QtCore.QUrl.fromLocalFile(__file__))
+
+    def __on_webview_load(self):
+        # The main document in the web view has finished loading,
+        # set/update the displayed wordcloud if required.
+        self.run_redraw_word_cloud()
 
     def _create_layout(self):
         self._new_webview()
@@ -166,24 +196,40 @@ span.selected {color:red !important}
         box.layout().addWidget(view)
 
     def cloud_reselect(self):
-        self.webview.evalJS('selectWords();')
+        self.webview.runJavaScript('selectWords();')
 
-    def on_cloud_pref_change(self):
-        self._new_webview()
-        self.webview.evalJS('OPTIONS["color"] = "{}"'.format(
-            'random-dark' if self.words_color else 'black'))
+    def run_redraw_word_cloud(self):
+        # update and run the wordcloud in the JS engine.
+        color = 'random-dark' if self.words_color else 'black'
         tilt_ratio, tilt_amount = {
             0: (0, 0),
             1: (.5,  PI/12),
             2: (.75, PI/5),
             3: (.9,  PI/2),
         }[self.words_tilt]
-        self.webview.evalJS('OPTIONS["minRotation"] = {}; \
-                             OPTIONS["maxRotation"] = {};'.format(-tilt_amount, tilt_amount))
-        self.webview.evalJS('OPTIONS["rotateRatio"] = {};'.format(tilt_ratio))
-        # Trigger cloud redrawing by constructing new webview, because everything else fail Macintosh
-        self.webview.evalJS('OPTIONS["list"] = {};'.format(self.wordlist))
-        self.webview.evalJS('redrawWordCloud();')
+        tilt_min, tilt_max = -tilt_amount, tilt_amount
+
+        script_template = textwrap.dedent(
+            """
+            if (typeof OPTIONS !== "undefined") {{
+                OPTIONS["color"] = "{color}";
+                OPTIONS["minRotation"] = {tilt_min};
+                OPTIONS["maxRotation"] = {tilt_max};
+                OPTIONS["rotateRatio"] = {tilt_ratio};
+                OPTIONS["list"] = {wordlist};
+                redrawWordCloud();
+                "Success";
+            }} else {{
+                "Try again";
+            }}
+            """)
+        script = script_template.format(
+            color=color, tilt_min=tilt_min, tilt_max=tilt_max,
+            tilt_ratio=tilt_ratio, wordlist=self.wordlist)
+        self.webview.runJavaScript(script, print)
+
+    def on_cloud_pref_change(self):
+        self.run_redraw_word_cloud()
 
     def _repopulate_wordcloud(self, words, weights):
         N_BEST = 200
@@ -201,8 +247,7 @@ span.selected {color:red !important}
             return np.clip(w/mean*MEAN_SIZE, MIN_SIZE, MAX_SIZE)
 
         self.wordlist = [[word, _size(weight)] for word, weight in zip(words, weights)]
-        self.webview.evalJS('OPTIONS["list"] = {};'.format(self.wordlist))
-        self.on_cloud_pref_change()
+        self.run_redraw_word_cloud()
 
     def on_topics_change(self, data):
         self.topics = data
